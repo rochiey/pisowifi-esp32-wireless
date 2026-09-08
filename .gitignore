@@ -1,0 +1,7 @@
+/_ref
+/.reasonix
+/.venv
+/build
+.log
+.toml
+.bin
