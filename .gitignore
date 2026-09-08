@@ -2,6 +2,8 @@
 /.reasonix
 /.venv
 /build
-.log
-.toml
-.bin
+/PisoWifiBridge/build
+/build32
+*.log
+*.toml
+*.bin
