@@ -94,6 +94,18 @@
 
   REVISION 2026-10-01  (R7: pause-safe accounting + direct sales/event reporting)
 
+  R7.3 - AUTO-LOGIN FILE RELIABILITY (2026-10-02):
+    * The voucher-per-MAC auto-login file is now written with /file/print +
+      /file/set contents over the SAME RouterOS API connection as the credit.
+      The old /tool fetch made the router fetch HTTP from the ESP32 - which can
+      time out while the ESP32 is busy inside the credit, leaving the customer
+      without auto-login.
+    * If that write still fails it is queued in NVS (4 slots) and retried from
+      loop() while idle; a 'voucher_file_recovered' event closes the audit loop
+      so Errors & Audit shows the problem resolved.
+    * New admin endpoint GET /publishTest?key=..&mac=..&voucher=.. writes one
+      file on demand (field verification without taking a coin).
+
   R7 - FIELD RELIABILITY (2026-10-01):
     * Multi-slot pending credit recovery: up to 4 uncredited purchases are kept
       (each with its voucher AND MAC) instead of a single slot that a second
@@ -283,6 +295,32 @@ PendingLegacy pendingLegacy;
 uint32_t pendingNextAttemptMs = 0;
 
 // ---------------------------------------------------------------------------
+// Deferred auto-login file publication (R7.3)
+// ---------------------------------------------------------------------------
+// If the inline file write ever fails, the job waits here (NVS on ESP32) and
+// tickVoucherPublish() retries it from loop() while the bridge is idle.
+#define PUBQ_MAGIC       0x50514233UL   // "PQB3"
+#define PUBQ_JOB_MAGIC   0x504A4F42UL   // "PJOB"
+#define PUBQ_SLOTS       4
+#define PUBQ_VOUCHER_MAX 24
+#define PUBQ_MAC_MAX     13
+#define PUBQ_RETRY_MS    30000UL
+
+struct PubJob {
+  uint32_t magic;
+  char voucher[PUBQ_VOUCHER_MAX];
+  char mac[PUBQ_MAC_MAX];
+};
+struct PubQueue {
+  uint32_t magic;
+  uint8_t count;
+  uint8_t pad[3];
+  PubJob job[PUBQ_SLOTS];
+};
+PubQueue pubQueue;
+uint32_t pubqNextAttemptMs = 0;
+
+// ---------------------------------------------------------------------------
 // Nightly idle-aware maintenance restart (24/7 units)
 // ---------------------------------------------------------------------------
 // Restarts the bridge once per day at a low-traffic hour, but ONLY when no
@@ -308,7 +346,7 @@ uint32_t nightlyLastCheckMs = 0;
 #define DEFAULT_API_PORT            8728
 #define DEFAULT_PULSES_PER_COIN     1
 #define DEFAULT_MINUTES_PER_COIN    5
-#define FW_REVISION                 "R7.2-2026-10-01"
+#define FW_REVISION                 "R7.3-2026-10-01"
 
 // ---------------------------------------------------------------------------
 // MikroTik RouterOS API
@@ -1434,6 +1472,82 @@ void handleReportTest() {
   server.send(200, "application/json", j);
 }
 
+// ---------------------------------------------------------------------------
+// Auto-login file retry queue helpers (R7.3)
+// ---------------------------------------------------------------------------
+bool pubqValid() { return pubQueue.magic == PUBQ_MAGIC; }
+
+void pubqPersist() {
+#ifdef ESP32
+  persPut(0, "pubq", pubQueue);
+#endif
+}
+
+uint8_t pubqCount() {
+  if (!pubqValid()) return 0;
+  if (pubQueue.count > PUBQ_SLOTS) return 0;
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < PUBQ_SLOTS; i++) {
+    if (pubQueue.job[i].magic == PUBQ_JOB_MAGIC && pubQueue.job[i].voucher[0]) n++;
+  }
+  return n;
+}
+
+void pubqEnqueue(const String& voucher, const String& mac) {
+  if (voucher.length() == 0) return;
+  if (!pubqValid()) { memset(&pubQueue, 0, sizeof(pubQueue)); pubQueue.magic = PUBQ_MAGIC; }
+  for (uint8_t i = 0; i < PUBQ_SLOTS; i++) {
+    if (pubQueue.job[i].magic == PUBQ_JOB_MAGIC &&
+        voucher.equalsIgnoreCase(String(pubQueue.job[i].voucher))) return;
+  }
+  int8_t idx = -1;
+  for (uint8_t i = 0; i < PUBQ_SLOTS; i++) {
+    if (pubQueue.job[i].magic != PUBQ_JOB_MAGIC) { idx = (int8_t)i; break; }
+  }
+  if (idx < 0) {   // full: keep the newest, drop the oldest
+    for (uint8_t i = 1; i < PUBQ_SLOTS; i++) pubQueue.job[i - 1] = pubQueue.job[i];
+    idx = PUBQ_SLOTS - 1;
+  }
+  PubJob& j = pubQueue.job[(uint8_t)idx];
+  memset(&j, 0, sizeof(j));
+  j.magic = PUBQ_JOB_MAGIC;
+  setField(j.voucher, sizeof(j.voucher), voucher);
+  String mc = mac;
+  mc.toUpperCase();
+  mc.replace(":", "");
+  setField(j.mac, sizeof(j.mac), mc);
+  pubQueue.count = pubqCount();
+  pubqPersist();
+  logWarn("[PUBQ] Queued auto-login file for " + voucher);
+}
+
+void pubqRemoveAt(uint8_t idx) {
+  if (idx >= PUBQ_SLOTS) return;
+  memset(&pubQueue.job[idx], 0, sizeof(pubQueue.job[idx]));
+  pubQueue.count = pubqCount();
+  pubqPersist();
+}
+
+void pubqLoad() {
+  memset(&pubQueue, 0, sizeof(pubQueue));
+#ifdef ESP32
+  if (!persGet(0, "pubq", pubQueue) || pubQueue.magic != PUBQ_MAGIC) {
+    pubQueue.magic = PUBQ_MAGIC;
+    pubQueue.count = 0;
+    return;
+  }
+#else
+  pubQueue.magic = PUBQ_MAGIC;
+  pubQueue.count = 0;
+  return;
+#endif
+  uint8_t n = pubqCount();
+  if (n > 0) {
+    logWarn("[PUBQ] " + String(n) + " auto-login file job(s) survived a reboot - will retry");
+    pubqNextAttemptMs = millis() + 10000;
+  }
+}
+
 String portalPage(const String& errorMsg, const String& adminKey) {
   String h;
   h.reserve(2600);
@@ -2261,28 +2375,21 @@ public:
     return true;
   }
 
-  // FIX A (reconnect UX): publishes the voucher-per-MAC file the hotspot
-  // login page reads for returning-customer auto-login:
-  //     GET /data/<MAC without colons>.txt   ->   "<voucher>#"
-  // login.html/core.js parse field 0 with split("#")[0] as the username.
-  // RouterOS 6 has NO /file/add (=contents= is RouterOS 7), so instead the
-  // bridge serves the content on its own HTTP endpoint (/voucherdata) and
-  // asks the router to download it: /tool fetch url=... dst-path=...
-  // (verified on the live 6.49.17 box - the fetch runs with the same API
-  // credentials and writes into hotspot/data/).
+  // R7.3: publish the voucher-per-MAC auto-login file with /file/print +
+  // /file/set contents over the SAME API connection as the credit. The old
+  // /tool fetch made the router fetch HTTP from the ESP32 - that inbound
+  // request could time out while the ESP32 was busy inside the credit, which
+  // left the customer without auto-login. Verified on RouterOS 6.49.17.
   bool writeVoucherDataFile(const String& macNoColon, const String& voucher) {
     if (macNoColon.length() < 8 || voucher.length() == 0) return false;
-    String url = "=url=http://" + WiFi.localIP().toString() +
-                 "/voucherdata?m=" + macNoColon + "&v=" + voucher;
-    String dst = "=dst-path=hotspot/data/" + macNoColon + ".txt";
-    const char* f[] = {"/tool/fetch", url.c_str(), "=mode=http", dst.c_str()};
-    // waitForTerminal ignores the !re status rows and returns on !done.
-    if (!runCommandT(f, 4, 9000)) {
-      // A fetch failure must never make the (already landed) credit look
-      // failed - callers treat this as a warning, not a credit error.
-      return false;
-    }
-    return true;
+    String path = "hotspot/data/" + macNoColon + ".txt";
+    String printFile = "=file=" + path;
+    const char* mk[] = {"/file/print", printFile.c_str(), "?name=dummyfile"};
+    if (!runCommandT(mk, 3, 5000)) return false;
+    String numbers  = "=numbers=" + path;
+    String contents = "=contents=" + voucher + "#";
+    const char* st[] = {"/file/set", numbers.c_str(), contents.c_str()};
+    return runCommandT(st, 3, 5000);
   }
 
   void disconnect() {
@@ -2412,20 +2519,19 @@ bool performCredit(const String& userName, uint16_t minutes, String& err,
   // open - the login page auto-logs returning phones with it (only the file
   // write can fail here; the credit above already landed).
   if (macNoColon.length() >= 8) {
-    // R7: retry - a transient router-side fetch failure right after the credit
-    // used to leave the phone without its auto-login voucher file.
-    bool fileOk = false;
-    for (uint8_t attempt = 0; attempt < 2 && !fileOk; attempt++) {
-      if (attempt) delay(400);
-      fileOk = api.writeVoucherDataFile(macNoColon, userName);
-    }
-    if (fileOk) {
+    // R7.3: one quick attempt on the credit connection. On failure the job is
+    // queued in NVS and retried from loop() until it lands, so a transient
+    // failure never leaves a customer without auto-login (and the recovery
+    // closes the audit trail).
+    if (api.writeVoucherDataFile(macNoColon, userName)) {
       logInfo("[DATA] Wrote hotspot/data/" + macNoColon + ".txt -> " + userName);
     } else {
       logWarn("[DATA] Could not write hotspot/data/" + macNoColon + ".txt: " + api.lastError);
       reportEvent("voucher_file_failed", 1,
-                  "Auto-login file write failed for " + userName + ": " + api.lastError,
+                  "Auto-login file write failed for " + userName + " (" + api.lastError +
+                  ") - queued for automatic retry",
                   userName, macNoColon, 0, minutes);
+      pubqEnqueue(userName, macNoColon);
     }
   }
 
@@ -2636,6 +2742,100 @@ void tickPendingCredit() {
     }
     return;   // one slot per tick
   }
+}
+
+// ---------------------------------------------------------------------------
+// Deferred auto-login file publication (R7.3)
+// ---------------------------------------------------------------------------
+// Retries queued voucher-file jobs while the bridge is idle. It uses a fresh
+// API connection and the same /file/print + /file/set commands as the credit
+// path - no inbound HTTP from the router, so it cannot deadlock against the
+// coin session. Success raises voucher_file_recovered so the audit trail shows
+// the problem resolved.
+void tickVoucherPublish() {
+  if (portalMode || pubqCount() == 0) return;
+  if (cycleState != CYCLE_IDLE) return;
+  if (pendingAny()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if ((int32_t)(millis() - pubqNextAttemptMs) < 0) return;
+  pubqNextAttemptMs = millis() + PUBQ_RETRY_MS;
+
+  IPAddress gw;
+  if (!parseIPv4(config.gatewayIp, gw)) return;
+  for (uint8_t i = 0; i < PUBQ_SLOTS; i++) {
+    PubJob& j = pubQueue.job[i];
+    if (j.magic != PUBQ_JOB_MAGIC || j.voucher[0] == 0) continue;
+    RouterOSApi api;
+    bool connected = false;
+    for (uint8_t attempt = 0; attempt < 2 && !connected; attempt++) {
+      if (attempt) delay(200);
+      connected = api.connect(gw, config.apiPort);
+    }
+    if (!connected) return;
+    if (!api.login(config.apiUser, config.apiPass)) { api.disconnect(); return; }
+    String vc(j.voucher);
+    String mc(j.mac);
+    if (api.writeVoucherDataFile(mc, vc)) {
+      api.disconnect();
+      logInfo("[PUBQ] Recovered auto-login file for " + vc);
+      reportEvent("voucher_file_recovered", 0,
+                  "Auto-login file written for " + vc + " after an automatic retry",
+                  vc, mc, 0, 0);
+      pubqRemoveAt(i);
+    } else {
+      logWarn("[PUBQ] Retry failed for " + vc + ": " + api.lastError);
+      api.disconnect();
+    }
+    return;   // one job per tick
+  }
+}
+
+// Admin: write one auto-login file on demand so the mechanism can be verified
+// in the field without taking a coin.
+void handlePublishTest() {
+  String key = urlDecode(server.arg("key"));
+  if (key != String(config.apiPass)) {
+    server.send(401, "text/plain", "unauthorized");
+    return;
+  }
+  String macRaw = urlDecode(server.arg("mac"));
+  String voucher = urlDecode(server.arg("voucher"));
+  voucher.trim();
+  String macNorm;
+  if (!normalizeMac(macRaw, macNorm) || voucher.length() == 0) {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"need mac=AA:BB:CC:DD:EE:FF&voucher=P12345\"}");
+    return;
+  }
+  String macNC = macNorm;
+  macNC.replace(":", "");
+  macNC.toUpperCase();
+  if (portalMode || WiFi.status() != WL_CONNECTED) {
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"not connected\"}");
+    return;
+  }
+  IPAddress gw;
+  if (!parseIPv4(config.gatewayIp, gw)) {
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"bad gateway\"}");
+    return;
+  }
+  RouterOSApi api;
+  bool connected = false;
+  for (uint8_t attempt = 0; attempt < 2 && !connected; attempt++) {
+    if (attempt) delay(200);
+    connected = api.connect(gw, config.apiPort);
+  }
+  if (!connected || !api.login(config.apiUser, config.apiPass)) {
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"api connect/login failed\"}");
+    return;
+  }
+  bool ok = api.writeVoucherDataFile(macNC, voucher);
+  String err = api.lastError;
+  api.disconnect();
+  server.send(200, "application/json",
+              String("{\"ok\":") + (ok ? "true" : "false") +
+              ",\"mac\":\"" + macNC + "\",\"voucher\":\"" + jsonEscape(voucher) +
+              "\",\"error\":\"" + jsonEscape(err) + "\"}");
 }
 
 // Loads the nightly-restart marker so a reboot within the same restart hour
@@ -4114,6 +4314,7 @@ void registerRoutes() {
   server.on("/reboot", HTTP_GET, handleReboot);
   server.on("/debugUsers", HTTP_GET, handleDebugUsers);
   server.on("/reportTest", HTTP_GET, handleReportTest);
+  server.on("/publishTest", HTTP_GET, handlePublishTest);
   server.on("/log", HTTP_GET, handleLog);
   server.on("/setRates", HTTP_GET, handleSetRates);
   server.on("/setRates", HTTP_POST, handleSetRates);
@@ -4193,6 +4394,7 @@ void setup() {
   salesLoad();
   promoLoad();
   pendingLoad();
+  pubqLoad();
   nightlyLoad();
   pinMode(gatePin(), OUTPUT);
   digitalWrite(gatePin(), gateCloseLevel());   // apply configured gate pin/polarity
@@ -4248,6 +4450,7 @@ void loop() {
     watchPortalJoin();   // R5: boot-order safety net - leave the setup portal on our own
   }
   if (!portalMode) tickPendingCredit();
+  if (!portalMode) tickVoucherPublish();
   if (!portalMode) tickNtp();
   if (!portalMode) tickNightlyRestart();
   if (!portalMode) flushRemoteLogs();

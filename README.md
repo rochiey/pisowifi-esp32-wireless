@@ -1,4 +1,4 @@
-# PisoWiFi ESP32 Wireless Bridge (R7.2)
+# PisoWiFi ESP32 Wireless Bridge (R7.3)
 
 Coin-acceptor bridge for a Piso WiFi vendo. An ESP32 (ESP32 DevKit 30-pin)
 watches the coin acceptor pulse line and credits MikroTik hotspot users over
@@ -22,7 +22,7 @@ arduino-cli compile --fqbn "esp32:esp32:esp32:FlashMode=dio" PisoWifiBridge
 
 ## OTA update
 
-python3 tools/espota_newprotocol.py -i 10.0.0.5 -p 3232 -a "<api password>" -f firmware/PisoWifiBridge_R7.2.bin
+python3 tools/espota_newprotocol.py -i 10.0.0.5 -p 3232 -a "<api password>" -f firmware/PisoWifiBridge_R7.3.bin
 
 The OTA server is only serviced while the coin slot is IDLE and no credit is
 pending recovery, so an update can never interrupt a customer. If the bridge
@@ -68,6 +68,7 @@ needed). Rollback image: firmware/PisoWifiBridge_R6.bin.
 - R7: multi-slot pending recovery, direct dashboard reporting, voucher-file retry, safe Wi-Fi recovery.
 - R7.1: 8 recovery slots / 16 report slots, coin-slot guard, overflow merge, OTA self-heal.
 - R7.2: report outbox raised to 32 items (~2 h of busy sales can queue while the internet is down).
+- R7.3: auto-login voucher file is written directly over the RouterOS API (/file/print + /file/set contents) instead of the router fetching HTTP from the ESP32; failures queue in NVS and retry with a voucher_file_recovered audit event; new GET /publishTest admin endpoint.
 
 ## License
 
