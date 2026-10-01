@@ -308,7 +308,7 @@ uint32_t nightlyLastCheckMs = 0;
 #define DEFAULT_API_PORT            8728
 #define DEFAULT_PULSES_PER_COIN     1
 #define DEFAULT_MINUTES_PER_COIN    5
-#define FW_REVISION                 "R7.1-2026-10-01"
+#define FW_REVISION                 "R7.2-2026-10-01"
 
 // ---------------------------------------------------------------------------
 // MikroTik RouterOS API
@@ -409,7 +409,7 @@ uint32_t nightlyLastCheckMs = 0;
 #define REPORT_VOUCHER_MAX   16
 #define REPORT_EEPROM_OFFSET 896
 #ifdef ESP32
-  #define REPORT_SLOTS       16   // R7.1: long internet outage buffer
+  #define REPORT_SLOTS       32   // R7.2: ~2 h of busy sales can queue while the internet is down
   #define REPORT_PERSIST     1
   #define REPORT_STORE_KEY   "rpt7"
 #else
