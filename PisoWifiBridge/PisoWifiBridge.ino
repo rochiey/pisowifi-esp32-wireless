@@ -67,6 +67,50 @@
     monitor app.
 
   ----------------------------------------------------------------------------
+  REVISION 2026-09-10  (boot-order self-heal + done-press closeout)
+
+  R6 - DONE-PRESS CLOSEOUT (2026-09-10):
+    * endSession() now DELIVERS the closeout value synchronously instead of
+      only queueing it: pressing "Done" a moment after a coin (before the
+      1.5 s silence batch credited it) used to end the session with the value
+      routed to the pending-recovery queue and /useVoucher answering
+      "coins.wait.expired" - the popup showed an error and the time arrived
+      later. The reply now carries the full awarded time; only a genuine
+      API failure falls back to the recovery queue.
+    * When Done is pressed before any pulse has arrived, the closeout grace
+      now runs its full 1.2 s (it used to bail out early on an idle line),
+      so an accepted, still-travelling coin can never be cut off uncounted.
+
+  R5 - BOOT-ORDER SELF-HEAL (2026-09-10):
+    * watchPortalJoin(): while the setup portal is active, retry the
+      configured SSID every 30 s (AP+STA mode - the 192.168.4.1 setup
+      portal stays reachable) and leave the portal automatically as soon
+      as the router is back. Previously, an ESP that booted before the
+      hAP Lite was ready (the 3x15 s boot join window expired) stayed in
+      setup mode FOREVER - 10.0.0.5 unreachable, "coinslot busy" - until
+      a manual power cycle. This removes the old "router first, ESP
+      second" boot-order requirement.
+    * startStation(): failure log updated to say the unit keeps retrying.
+
+  REVISION 2026-10-01  (R7: pause-safe accounting + direct sales/event reporting)
+
+  R7 - FIELD RELIABILITY (2026-10-01):
+    * Multi-slot pending credit recovery: up to 4 uncredited purchases are kept
+      (each with its voucher AND MAC) instead of a single slot that a second
+      failed credit could overwrite. A recovered credit also republishes the
+      voucher-per-MAC data file so returning-customer auto-login keeps working.
+    * Direct sales + event reporting to the dashboard
+      (https://pisowifi.rochiey.dev/api/pisowifi): every finished session posts
+      its own sale (source=esp32), and credit failures, pending recovery,
+      boots, Wi-Fi loss/recovery and heartbeats are posted as audit events.
+      A small NVS outbox retries until the server acknowledges, so a sale can
+      never be lost with a customer's phone.
+    * The voucher data-file write is retried (a transient router fetch failure
+      right after a credit used to break returning-customer auto-login).
+    * Wi-Fi recovery never hard-resets the radio or reboots the bridge while a
+      coin session is open or a credit is still pending - it waits for idle.
+    * Firmware revision is reported on / and /stats.
+
   REVISION 2026-09-08  (deterministic crediting + flash-wear + OTA)
 
   R3 - LIVE-SESSION KICK-BEFORE-CREDIT (2026-09-08):
@@ -202,17 +246,40 @@
 // Crash-safe pending credit recovery (coins counted, credit not delivered)
 // ---------------------------------------------------------------------------
 #define PENDING_EEPROM_OFFSET 768
-#define PENDING_MAGIC         0x50435232UL   // "PCR2" (v2: stores voucher name)
+#define PENDING_MAGIC         0x50435233UL   // "PCR3" per-slot marker
+#define PENDING_STORE_MAGIC   0x50435333UL   // "PCS3" store marker
 #define PENDING_RETRY_MS      15000UL
-#define PENDING_NAME_MAX      32   // voucher / username length limit
+#define PENDING_NAME_MAX      24   // voucher / username length limit
+#define PENDING_MAC_MAX       13   // colon-free uppercase MAC + NUL
+#ifdef ESP32
+  #define PENDING_SLOTS       8    // R7.1: survive multi-customer outages
+#else
+  #define PENDING_SLOTS       1    // ESP8266 EEPROM is only 1 KB
+#endif
 
-struct PendingCredit {
-  uint32_t magic;
+struct PendingSlot {
+  uint16_t magic;
   uint16_t minutes;
-  char     name[PENDING_NAME_MAX];   // hotspot username (voucher or MAC name)
+  char     name[PENDING_NAME_MAX];
+  char     mac[PENDING_MAC_MAX];
 };
 
-PendingCredit pending;
+struct PendingStore {
+  uint32_t magic;
+  uint8_t  count;
+  uint8_t  pad[3];
+  PendingSlot slot[PENDING_SLOTS];
+};
+
+// Legacy single-slot record (firmware <= R6), migrated on first boot.
+struct PendingLegacy {
+  uint32_t magic;
+  uint16_t minutes;
+  char     name[32];
+};
+
+PendingStore pendingStore;
+PendingLegacy pendingLegacy;
 uint32_t pendingNextAttemptMs = 0;
 
 // ---------------------------------------------------------------------------
@@ -241,6 +308,7 @@ uint32_t nightlyLastCheckMs = 0;
 #define DEFAULT_API_PORT            8728
 #define DEFAULT_PULSES_PER_COIN     1
 #define DEFAULT_MINUTES_PER_COIN    5
+#define FW_REVISION                 "R7.1-2026-10-01"
 
 // ---------------------------------------------------------------------------
 // MikroTik RouterOS API
@@ -258,7 +326,9 @@ uint32_t nightlyLastCheckMs = 0;
 #define WIFI_RECONNECT_INTERVAL_MS  10000
 #define GATEWAY_CHECK_INTERVAL_MS   30000
 #define WIFI_HARD_RESET_AFTER_MS    60000
-#define WIFI_RESTART_AFTER_MS       120000
+#define WIFI_RESTART_AFTER_MS       600000   // R7: 10 min, and only while idle
+#define PORTAL_JOIN_RETRY_MS        30000   // setup portal: retry the router SSID every 30 s
+#define PORTAL_JOIN_WAIT_MS         8000    // ...waiting up to 8 s for each join attempt
 #define NTP_RETRY_INTERVAL_MS       300000  // re-attempt NTP every 5 min when unsynced
 
 // ---------------------------------------------------------------------------
@@ -320,6 +390,52 @@ uint32_t nightlyLastCheckMs = 0;
 #define REMOTE_QUEUE_MAX            8
 #define REMOTE_LINE_MAX             96
 #define REMOTE_FLUSH_INTERVAL_MS    30000
+
+// ---------------------------------------------------------------------------
+// Direct sales + event reporting (dashboard)
+// ---------------------------------------------------------------------------
+// The vendo reports its OWN sales instead of trusting the customer's phone.
+// Items wait in a small NVS outbox and are retried until the server answers
+// 2xx, so a coin sale can never be lost with a phone's browser cache.
+#define REPORT_BASE_DEFAULT  "https://pisowifi.rochiey.dev/api/pisowifi"
+#define REPORT_LOG_URL       "https://pisowifi.rochiey.dev/api/pisowifi/log"
+#define PISO_VENDO_NAME      "Pineda WIFI VENDO"
+#define REPORT_MAGIC         0x52505437UL      // "RPT7"
+#define REPORT_ITEM_MAGIC    0x49544D37UL      // "ITM7"
+#define REPORT_RETRY_MS      20000UL
+#define REPORT_HEARTBEAT_MS  1800000UL         // 30 min
+#define REPORT_TYPE_MAX      24
+#define REPORT_MSG_MAX       112
+#define REPORT_VOUCHER_MAX   16
+#define REPORT_EEPROM_OFFSET 896
+#ifdef ESP32
+  #define REPORT_SLOTS       16   // R7.1: long internet outage buffer
+  #define REPORT_PERSIST     1
+  #define REPORT_STORE_KEY   "rpt7"
+#else
+  #define REPORT_SLOTS       2
+  #define REPORT_PERSIST     0
+  #define REPORT_STORE_KEY   "rpt7"
+#endif
+
+struct ReportItem {
+  uint32_t magic;
+  uint8_t  kind;         // 0 = sale, 1 = event
+  uint8_t  severity;     // 0 = info, 1 = warning, 2 = error
+  uint16_t coins;
+  uint16_t minutes;
+  char     voucher[REPORT_VOUCHER_MAX];
+  char     mac[PENDING_MAC_MAX];
+  char     type[REPORT_TYPE_MAX];
+  char     message[REPORT_MSG_MAX];
+};
+
+struct ReportStore {
+  uint32_t magic;
+  uint16_t head;
+  uint16_t count;
+  ReportItem item[REPORT_SLOTS];
+};
 
 // ---------------------------------------------------------------------------
 // Persistent configuration (EEPROM, CRC protected)
@@ -428,6 +544,7 @@ bool wifiLostLogged = false;
 uint32_t lastGatewayCheckMs = 0;
 uint32_t wifiDownSince = 0;
 uint32_t lastWifiHardResetMs = 0;
+uint32_t lastPortalJoinMs = 0;   // R5: setup-portal router-retry pacing
 uint8_t gatewayFailCount = 0;
 
 // JuanFi-compatible top-up session (used by the router-hosted hotspot page)
@@ -467,6 +584,13 @@ uint32_t  lastTopUpStartMs = 0;
 
 SalesStats sales;
 PromoConfig promo;
+
+// Persistent sales/event report outbox (see REPORT_* above)
+ReportStore reportStore;
+uint32_t lastReportAttemptMs = 0;
+uint32_t lastHeartbeatMs = 0;
+bool lastReportOk = false;
+String lastReportDetail = "no attempt yet";
 
 // Session sales accumulation: committed ONCE at session end instead of once
 // per batch credit (this is where the old firmware wore the flash out).
@@ -935,7 +1059,7 @@ void sendRemotePost(WiFiClient& client, const String& host, const String& path, 
 }
 
 void flushRemoteLogs() {
-  if (strlen(config.logUrl) == 0 || remoteCount == 0) return;
+  if (remoteCount == 0) return;
   if (cycleState != CYCLE_IDLE) return;
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -946,7 +1070,9 @@ void flushRemoteLogs() {
   String host, path;
   uint16_t port = 80;
   bool useTls = false;
-  if (!parseLogUrl(String(config.logUrl), host, port, path, useTls)) {
+  String logUrl = String(config.logUrl);
+  if (logUrl.length() == 0) logUrl = String(REPORT_LOG_URL);   // default: dashboard
+  if (!parseLogUrl(logUrl, host, port, path, useTls)) {
     logWarn("[REMOTE] Invalid log URL in configuration - remote logging disabled");
     remoteCount = 0;
     return;
@@ -1081,6 +1207,232 @@ String jsonEscape(const String& in) {
 // ===========================================================================
 //  Setup portal (WPA2 captive portal at 192.168.4.1) and station join
 // ===========================================================================
+
+
+// ---------------------------------------------------------------------------
+// Direct reporting to the sales dashboard (sales + audit events)
+// ---------------------------------------------------------------------------
+bool reportStoreValid() { return reportStore.magic == REPORT_MAGIC; }
+
+void reportPersist() {
+#if REPORT_PERSIST
+  persPut(REPORT_EEPROM_OFFSET, REPORT_STORE_KEY, reportStore);
+#endif
+}
+
+uint16_t pendingReportCount() {
+  if (!reportStoreValid()) return 0;
+  if (reportStore.count > REPORT_SLOTS) return 0;
+  return reportStore.count;
+}
+
+void reportEnqueueItem(uint8_t kind, uint8_t severity, uint16_t coins, uint16_t minutes,
+                       const String& voucher, const String& mac, const char* type,
+                       const String& message) {
+  if (!reportStoreValid()) {
+    memset(&reportStore, 0, sizeof(reportStore));
+    reportStore.magic = REPORT_MAGIC;
+  }
+  if (reportStore.count >= REPORT_SLOTS) {   // drop the OLDEST, never the newest
+    reportStore.head = (uint16_t)((reportStore.head + 1) % REPORT_SLOTS);
+    reportStore.count = REPORT_SLOTS - 1;
+  }
+  uint16_t idx = (uint16_t)((reportStore.head + reportStore.count) % REPORT_SLOTS);
+  ReportItem& it = reportStore.item[idx];
+  memset(&it, 0, sizeof(it));
+  it.magic = REPORT_ITEM_MAGIC;
+  it.kind = kind;
+  it.severity = severity;
+  it.coins = coins;
+  it.minutes = minutes;
+  setField(it.voucher, sizeof(it.voucher), voucher);
+  String mc = mac;
+  mc.toUpperCase();
+  mc.replace(":", "");
+  setField(it.mac, sizeof(it.mac), mc);
+  setField(it.type, sizeof(it.type), String(type));
+  setField(it.message, sizeof(it.message), message);
+  reportStore.count++;
+  reportPersist();
+}
+
+void reportEvent(const char* type, uint8_t severity, const String& message,
+                 const String& voucher, const String& mac,
+                 uint16_t coins, uint16_t minutes) {
+  reportEnqueueItem(1, severity, coins, minutes, voucher, mac, type, message);
+  logInfo(String("[REPORT] queued event ") + type + ": " + message);
+}
+
+void reportSale(uint16_t coins, uint16_t minutes, const String& voucher, const String& mac) {
+  if (coins == 0 && minutes == 0) return;
+  reportEnqueueItem(0, 0, coins, minutes, voucher, mac, "sale", "session sale");
+  logInfo("[REPORT] queued sale " + String(coins) + " coin(s) / " + String(minutes) +
+          " min for " + voucher);
+}
+
+String isoNowUtc() {
+  time_t now = time(nullptr);
+  if (now < 1000000000L) return String("");
+  struct tm tmv;
+  gmtime_r(&now, &tmv);
+  char buf[24];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+  return String(buf);
+}
+
+int httpPostRaw(Client& c, const String& host, const String& path, const String& json) {
+  c.print(F("POST "));
+  c.print(path);
+  c.println(F(" HTTP/1.1"));
+  c.print(F("Host: "));
+  c.println(host);
+  c.println(F("Content-Type: application/json"));
+  c.print(F("Content-Length: "));
+  c.println(json.length());
+  c.println(F("Connection: close"));
+  c.println();
+  c.print(json);
+  int code = 0;
+  uint32_t start = millis();
+  while ((uint32_t)(millis() - start) < 8000UL) {
+    if (c.available()) {
+      String status = c.readStringUntil('\n');
+      int sp = status.indexOf(' ');
+      if (sp > 0) code = status.substring(sp + 1).toInt();
+      break;
+    }
+    if (!c.connected()) break;
+    delay(1);
+    yield();
+  }
+  return code;
+}
+
+bool postJsonUrl(const String& url, const String& json, String& detail) {
+  String host, path;
+  uint16_t port = 80;
+  bool useTls = false;
+  if (!parseLogUrl(url, host, port, path, useTls)) { detail = "bad url"; return false; }
+  int code = 0;
+  if (useTls) {
+    WiFiClientSecure c;
+    c.setInsecure();
+    c.setTimeout(6);
+    if (!c.connect(host.c_str(), port)) { detail = "tls connect " + host + " failed"; return false; }
+    code = httpPostRaw(c, host, path, json);
+    c.stop();
+  } else {
+    WiFiClient c;
+    c.setTimeout(6);
+    if (!c.connect(host.c_str(), port)) { detail = "connect " + host + " failed"; return false; }
+    code = httpPostRaw(c, host, path, json);
+    c.stop();
+  }
+  if (code >= 200 && code <= 299) { detail = String("HTTP ") + String(code); return true; }
+  detail = String("server replied HTTP ") + String(code);
+  return false;
+}
+
+String reportItemJson(const ReportItem& it) {
+  String ts = isoNowUtc();
+  String j;
+  if (it.kind == 0) {
+    j = "{\"event\":\"pisowifi_sale\",\"type\":\"INTERNET\",\"total_amount\":" + String(it.coins) +
+        ",\"voucher\":\"" + jsonEscape(String(it.voucher)) + "\"" +
+        ",\"mac\":\"" + jsonEscape(String(it.mac)) + "\"" +
+        ",\"client_ip\":\"\",\"vendo_name\":\"" PISO_VENDO_NAME "\"" +
+        ",\"vendo_ip\":\"" + WiFi.localIP().toString() + "\"" +
+        ",\"time_added_seconds\":" + String((uint32_t)it.minutes * 60UL) +
+        ",\"validity\":\"\",\"data_mb\":\"\",\"source\":\"esp32\"";
+  } else {
+    const char* sev = (it.severity == 2) ? "error" : ((it.severity == 1) ? "warning" : "info");
+    j = "{\"event\":\"pisowifi_event\",\"type\":\"" + jsonEscape(String(it.type)) + "\"" +
+        ",\"severity\":\"" + sev + "\"" +
+        ",\"message\":\"" + jsonEscape(String(it.message)) + "\"" +
+        ",\"voucher\":\"" + jsonEscape(String(it.voucher)) + "\"" +
+        ",\"mac\":\"" + jsonEscape(String(it.mac)) + "\"" +
+        ",\"coins\":" + String(it.coins) +
+        ",\"minutes\":" + String(it.minutes) +
+        ",\"device_id\":\"" + jsonEscape(String(config.deviceId)) + "\"" +
+        ",\"vendo_name\":\"" PISO_VENDO_NAME "\"" +
+        ",\"vendo_ip\":\"" + WiFi.localIP().toString() + "\"" +
+        ",\"source\":\"esp32\"";
+  }
+  if (ts.length() > 0) j += ",\"timestamp\":\"" + ts + "\"";
+  j += ",\"firmware\":\"" FW_REVISION "\"";
+  j += "}";
+  return j;
+}
+
+// Sends the oldest queued item. Returns true when the server acknowledged.
+bool reportFlushOne(String& detail) {
+  if (!reportStoreValid() || reportStore.count == 0) { detail = "outbox empty"; return true; }
+  ReportItem& it = reportStore.item[reportStore.head % REPORT_SLOTS];
+  if (it.magic != REPORT_ITEM_MAGIC) {   // corrupt slot - drop it
+    reportStore.head = (uint16_t)((reportStore.head + 1) % REPORT_SLOTS);
+    reportStore.count--;
+    reportPersist();
+    detail = "dropped corrupt slot";
+    return false;
+  }
+  String url = String(REPORT_BASE_DEFAULT) + ((it.kind == 0) ? "/sale" : "/event");
+  String json = reportItemJson(it);
+  bool ok = postJsonUrl(url, json, detail);
+  lastReportOk = ok;
+  lastReportDetail = detail;
+  if (ok) {
+    reportStore.head = (uint16_t)((reportStore.head + 1) % REPORT_SLOTS);
+    reportStore.count--;
+    reportPersist();
+  }
+  return ok;
+}
+
+void tickReportOutbox() {
+  if (portalMode) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (cycleState != CYCLE_IDLE) return;   // never block a coin session
+  uint32_t now = millis();
+
+  if (reportStoreValid() && reportStore.count > 0) {
+    if ((int32_t)(now - lastReportAttemptMs) < 0) return;
+    lastReportAttemptMs = now + REPORT_RETRY_MS;
+    String detail;
+    if (reportFlushOne(detail)) {
+      logInfo("[REPORT] Sent queued item (" + String(reportStore.count) + " left)");
+    } else {
+      logWarn("[REPORT] Send failed: " + detail);
+    }
+    return;
+  }
+
+  // Quiet heartbeat so the dashboard can tell "vendo offline" from "no sales".
+  if ((uint32_t)(now - lastHeartbeatMs) >= REPORT_HEARTBEAT_MS) {
+    lastHeartbeatMs = now;
+    String hb = "heap=" + String(ESP.getFreeHeap());
+    hb += " rssi=" + String(WiFi.RSSI());
+    hb += " boots=" + String(sales.bootCount);
+    hb += " cycles=" + String(sales.totalCycles) + " coins=" + String(sales.totalCoins) +
+          " minutes=" + String(sales.totalMinutes) + " failed=" + String(sales.failedCycles);
+    reportEvent("heartbeat", 0, hb, "", "", 0, 0);
+    lastReportAttemptMs = 0;   // send it on the next tick
+  }
+}
+
+void handleReportTest() {
+  String key = urlDecode(server.arg("key"));
+  if (key != String(config.apiPass)) {
+    server.send(401, "text/plain", "unauthorized");
+    return;
+  }
+  reportEvent("report_test", 0, "Manual report test from /reportTest", "", "", 0, 0);
+  String detail;
+  bool ok = reportFlushOne(detail);
+  String j = "{\"ok\":" + String(ok ? "true" : "false") +
+             ",\"outbox\":" + String(pendingReportCount()) +
+             ",\"detail\":\"" + jsonEscape(lastReportDetail) + "\"}";
+  server.send(200, "application/json", j);
+}
 
 String portalPage(const String& errorMsg, const String& adminKey) {
   String h;
@@ -1221,6 +1573,7 @@ String statusPage() {
     h += "<p>Rate: " + String(config.pulsesPerCoin) + " pulse(s) = " +
          String(config.minutesPerCoin) + " minute(s)</p>";
   }
+  h += "<p>Firmware: " FW_REVISION " | Report outbox: " + String(pendingReportCount()) + " item(s)</p>";
   h += "<p>Endpoint: <code>GET /coin?mac=AA:BB:CC:DD:EE:FF</code></p>";
   h += "<p><a href='/insert'>Insert Coin page</a></p>";
   h += "<p><a href='/settings'>Open Settings</a> — admin key is your MikroTik API password.</p>";
@@ -1281,7 +1634,7 @@ void startStation() {
            ", status: " + wifiStatusText(WiFi.status()) + ")");
   }
 
-  logErr("[NETWORK ERROR] Could not join the configured SSID. Opening the setup portal so you can correct the settings.");
+  logErr("[NETWORK ERROR] Could not join the configured SSID within 45s. Opening the setup portal - the unit keeps retrying the router in the background and starts working on its own once the SSID is back.");
   startPortal();
 }
 
@@ -1708,6 +2061,14 @@ public:
     return waitForTerminal(API_REPLY_TIMEOUT_MS);
   }
 
+  // Same as runCommand but with a caller-chosen reply budget. /tool/fetch
+  // performs a full HTTP download on the router and can exceed the default
+  // 4 s under load.
+  bool runCommandT(const char* words[], int count, uint32_t timeoutMs) {
+    if (!sendSentence(words, count)) return false;
+    return waitForTerminal(timeoutMs);
+  }
+
   // Parses a RouterOS duration string into whole minutes. Handles the
   // compact form ("1w2d3h4m5s" subsets) AND the colon form RouterOS uses
   // for times ("hh:mm:ss", "mm:ss", optionally "1d hh:mm:ss"). Sub-minute
@@ -1916,7 +2277,7 @@ public:
     String dst = "=dst-path=hotspot/data/" + macNoColon + ".txt";
     const char* f[] = {"/tool/fetch", url.c_str(), "=mode=http", dst.c_str()};
     // waitForTerminal ignores the !re status rows and returns on !done.
-    if (!runCommand(f, 4)) {
+    if (!runCommandT(f, 4, 9000)) {
       // A fetch failure must never make the (already landed) credit look
       // failed - callers treat this as a warning, not a credit error.
       return false;
@@ -2043,6 +2404,7 @@ bool performCredit(const String& userName, uint16_t minutes, String& err,
 
   if (!api.creditUserPre(userName, minutes, userId, currentLimit)) {
     err = api.lastError;
+    reportEvent("credit_fail", 2, err, userName, macNoColon, 0, minutes);
     return false;
   }
 
@@ -2050,10 +2412,20 @@ bool performCredit(const String& userName, uint16_t minutes, String& err,
   // open - the login page auto-logs returning phones with it (only the file
   // write can fail here; the credit above already landed).
   if (macNoColon.length() >= 8) {
-    if (api.writeVoucherDataFile(macNoColon, userName)) {
+    // R7: retry - a transient router-side fetch failure right after the credit
+    // used to leave the phone without its auto-login voucher file.
+    bool fileOk = false;
+    for (uint8_t attempt = 0; attempt < 2 && !fileOk; attempt++) {
+      if (attempt) delay(400);
+      fileOk = api.writeVoucherDataFile(macNoColon, userName);
+    }
+    if (fileOk) {
       logInfo("[DATA] Wrote hotspot/data/" + macNoColon + ".txt -> " + userName);
     } else {
       logWarn("[DATA] Could not write hotspot/data/" + macNoColon + ".txt: " + api.lastError);
+      reportEvent("voucher_file_failed", 1,
+                  "Auto-login file write failed for " + userName + ": " + api.lastError,
+                  userName, macNoColon, 0, minutes);
     }
   }
 
@@ -2070,70 +2442,199 @@ bool performCredit(const String& userName, uint16_t minutes, String& err,
 // (Struct and globals live near the top of the file so the Arduino
 // auto-prototype pass sees them before any generated prototypes.)
 
-bool pendingValid(const PendingCredit& p) {
-  if (p.magic != PENDING_MAGIC) return false;
-  if (p.minutes < 1 || p.minutes > MAX_CREDIT_MINUTES) return false;
-  if (p.name[0] == 0) return false;
-  if (p.name[PENDING_NAME_MAX - 1] != 0) return false;   // must be NUL-terminated
+bool pendingSlotValid(const PendingSlot& s) {
+  if (s.magic != PENDING_MAGIC) return false;
+  if (s.minutes < 1 || s.minutes > MAX_CREDIT_MINUTES) return false;
+  if (s.name[0] == 0) return false;
+  if (s.name[PENDING_NAME_MAX - 1] != 0) return false;   // must be NUL-terminated
   for (uint8_t i = 0; i < PENDING_NAME_MAX; i++) {
-    char ch = p.name[i];
+    char ch = s.name[i];
     if (ch == 0) break;
     if (ch < 0x21 || ch > 0x7E) return false;   // printable ASCII, no whitespace
+  }
+  for (uint8_t i = 0; i < PENDING_MAC_MAX; i++) {
+    char ch = s.mac[i];
+    if (ch == 0) break;
+    if (ch < 0x21 || ch > 0x7E) return false;
   }
   return true;
 }
 
-void pendingSave(const String& userName, uint16_t minutes) {
-  memset(&pending, 0, sizeof(pending));
-  pending.magic = PENDING_MAGIC;
-  pending.minutes = minutes;
-  strncpy(pending.name, userName.c_str(), sizeof(pending.name) - 1);
-  persPut(PENDING_EEPROM_OFFSET, "pending", pending);
+uint8_t pendingCount() {
+  if (pendingStore.magic != PENDING_STORE_MAGIC) return 0;
+  if (pendingStore.count > PENDING_SLOTS) return 0;
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < PENDING_SLOTS; i++) {
+    if (pendingSlotValid(pendingStore.slot[i])) n++;
+  }
+  return n;
+}
+
+bool pendingAny() { return pendingCount() > 0; }
+
+int8_t pendingFindIndex(const String& name) {
+  for (uint8_t i = 0; i < PENDING_SLOTS; i++) {
+    if (pendingSlotValid(pendingStore.slot[i]) &&
+        name.equalsIgnoreCase(String(pendingStore.slot[i].name))) return (int8_t)i;
+  }
+  return -1;
+}
+
+void pendingPersist() {
+  persPut(PENDING_EEPROM_OFFSET, "pend3", pendingStore);
+}
+
+void pendingSave(const String& userName, uint16_t minutes, const String& macNoColon) {
+  if (minutes < 1) return;
+  if (pendingStore.magic != PENDING_STORE_MAGIC) {
+    memset(&pendingStore, 0, sizeof(pendingStore));
+    pendingStore.magic = PENDING_STORE_MAGIC;
+  }
+  String nm = userName;
+  nm.trim();
+  if (nm.length() > PENDING_NAME_MAX - 1) nm = nm.substring(0, PENDING_NAME_MAX - 1);
+  String mc = macNoColon;
+  mc.toUpperCase();
+  mc.replace(":", "");
+  if (mc.length() > PENDING_MAC_MAX - 1) mc = mc.substring(0, PENDING_MAC_MAX - 1);
+
+  int8_t idx = pendingFindIndex(nm);
+  if (idx < 0) {
+    for (uint8_t i = 0; i < PENDING_SLOTS; i++) {
+      if (!pendingSlotValid(pendingStore.slot[i])) { idx = (int8_t)i; break; }
+    }
+  }
+  if (idx < 0) {
+    // Store full (mid-session race; new sessions are refused while full).
+    // MERGE into the smallest record instead of dropping the value, so the
+    // total money owed is always preserved. The event names both vouchers so
+    // an operator can reconcile the attribution during a refund.
+    uint8_t worst = 0;
+    for (uint8_t i = 1; i < PENDING_SLOTS; i++) {
+      if (pendingStore.slot[i].minutes < pendingStore.slot[worst].minutes) worst = i;
+    }
+    PendingSlot& w = pendingStore.slot[worst];
+    uint32_t merged = (uint32_t)w.minutes + (uint32_t)minutes;
+    if (merged > 65535UL) merged = 65535UL;
+    String prevName(w.name);
+    w.minutes = (uint16_t)merged;
+    if (mc.length() > 0) strncpy(w.mac, mc.c_str(), sizeof(w.mac) - 1);
+    logErr("[PENDING] Recovery store full - merged " + String(minutes) + " min into " + prevName);
+    reportEvent("pending_overflow_merged", 2,
+                "Recovery store full: merged " + nm + " (" + String(minutes) + " min) into " + prevName,
+                nm, mc, 0, minutes);
+    pendingPersist();
+    eepromCommitNow();
+    return;
+  }
+  PendingSlot& s = pendingStore.slot[(uint8_t)idx];
+  bool existed = pendingSlotValid(s);
+  uint16_t keep = (existed && s.minutes > minutes) ? s.minutes : minutes;   // monotone
+  memset(&s, 0, sizeof(s));
+  s.magic = PENDING_MAGIC;
+  s.minutes = keep;
+  strncpy(s.name, nm.c_str(), sizeof(s.name) - 1);
+  if (mc.length() > 0) strncpy(s.mac, mc.c_str(), sizeof(s.mac) - 1);
+  pendingStore.count = pendingCount();
+  pendingPersist();
   eepromCommitNow();   // critical record - never coalesce a coin-taking write
-  logWarn("[PENDING] Saved uncredited purchase: " + userName + " " +
-          String(minutes) + " minute(s) - will retry automatically");
+  logWarn("[PENDING] Saved uncredited purchase: " + nm + " " + String(keep) +
+          " minute(s) mac=" + mc + " - will retry automatically");
+}
+
+void pendingRemoveAt(uint8_t idx) {
+  if (idx >= PENDING_SLOTS) return;
+  memset(&pendingStore.slot[idx], 0, sizeof(pendingStore.slot[idx]));
+  pendingStore.count = pendingCount();
+  pendingPersist();
+  eepromCommitNow();
+}
+
+// Removes only THIS customer's records - a successful credit for one voucher
+// must never erase a different customer's uncredited purchase.
+void pendingClearFor(const String& userName) {
+  bool changed = false;
+  for (uint8_t i = 0; i < PENDING_SLOTS; i++) {
+    if (pendingSlotValid(pendingStore.slot[i]) &&
+        userName.equalsIgnoreCase(String(pendingStore.slot[i].name))) {
+      memset(&pendingStore.slot[i], 0, sizeof(pendingStore.slot[i]));
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  pendingStore.count = pendingCount();
+  pendingPersist();
+  eepromCommitNow();
 }
 
 void pendingClear() {
-  pending.magic = 0;
-  persPut(PENDING_EEPROM_OFFSET, "pending", pending);
+  memset(&pendingStore, 0, sizeof(pendingStore));
+  pendingStore.magic = PENDING_STORE_MAGIC;
+  pendingPersist();
   eepromCommitNow();
 }
 
 void pendingLoad() {
-  if (!persGet(PENDING_EEPROM_OFFSET, "pending", pending)) {
-    persGetLegacy(PENDING_EEPROM_OFFSET, pending);
+  memset(&pendingStore, 0, sizeof(pendingStore));
+  bool have = persGet(PENDING_EEPROM_OFFSET, "pend3", pendingStore);
+  if (!have || pendingStore.magic != PENDING_STORE_MAGIC) {
+    // Migrate the legacy single-slot record (firmware <= R6) if present.
+    memset(&pendingLegacy, 0, sizeof(pendingLegacy));
+    if (persGet(PENDING_EEPROM_OFFSET, "pending", pendingLegacy) &&
+        pendingLegacy.magic == 0x50435232UL &&
+        pendingLegacy.minutes >= 1 && pendingLegacy.minutes <= MAX_CREDIT_MINUTES &&
+        pendingLegacy.name[0] != 0) {
+      logWarn("[PENDING] Migrating legacy single-slot recovery record");
+      pendingSave(String(pendingLegacy.name), pendingLegacy.minutes, String(""));
+    } else {
+      pendingStore.magic = PENDING_STORE_MAGIC;
+      pendingStore.count = 0;
+    }
   }
-  if (!pendingValid(pending)) {
-    pending.magic = 0;
+  uint8_t n = pendingCount();
+  if (n == 0) {
+    logInfo("[PENDING] No uncredited purchases on record");
     return;
   }
-  logWarn("[PENDING] Uncredited purchase found: " + String(pending.name) + " " +
-          String(pending.minutes) + " minute(s)");
   pendingNextAttemptMs = millis() + 5000;
+  for (uint8_t i = 0; i < PENDING_SLOTS; i++) {
+    if (!pendingSlotValid(pendingStore.slot[i])) continue;
+    logWarn("[PENDING] Uncredited purchase found: " + String(pendingStore.slot[i].name) +
+            " " + String(pendingStore.slot[i].minutes) + " minute(s) mac=" +
+            String(pendingStore.slot[i].mac));
+  }
 }
 
 // Retry loop, called from loop() while station mode is up. Waits for an idle
-// coin state and a healthy Wi-Fi link, then re-attempts the credit.
+// coin state and a healthy Wi-Fi link, then re-attempts the OLDEST credit.
 void tickPendingCredit() {
-  if (portalMode || pending.magic != PENDING_MAGIC) return;
+  if (portalMode || !pendingAny()) return;
   if (cycleState != CYCLE_IDLE) return;
   if (WiFi.status() != WL_CONNECTED) return;
   if ((int32_t)(millis() - pendingNextAttemptMs) < 0) return;
 
   pendingNextAttemptMs = millis() + PENDING_RETRY_MS;
-  String userName(pending.name);
-  String err;
-  logInfo("[PENDING] Retrying credit for " + userName + " ...");
-  if (performCredit(userName, pending.minutes, err)) {
-    salesRecordSale(0, pending.minutes);   // coin count unknown across reboot
-    remoteEnqueue(String("[INFO] RECOVERED credit ") + userName + " " +
-                  String(pending.minutes) + "min");
-    logInfo("[PENDING] Credit recovered for " + userName);
-    pendingClear();
-  } else {
-    logWarn("[PENDING] Retry failed: " + err);
-    remoteEnqueue(String("[ERROR] Pending credit retry failed: ") + err);
+  for (uint8_t i = 0; i < PENDING_SLOTS; i++) {
+    if (!pendingSlotValid(pendingStore.slot[i])) continue;
+    String userName(pendingStore.slot[i].name);
+    String macNC(pendingStore.slot[i].mac);
+    uint16_t mins = pendingStore.slot[i].minutes;
+    String err;
+    logInfo("[PENDING] Retrying credit for " + userName + " (" + String(mins) + " min)...");
+    if (performCredit(userName, mins, err, macNC)) {
+      reportEvent("pending_recovered", 0,
+                  "Recovered " + String(mins) + " min for " + userName,
+                  userName, macNC, 0, mins);
+      salesRecordSale(0, mins);   // coin count unknown across the failure
+      remoteEnqueue(String("[INFO] RECOVERED credit ") + userName + " " + String(mins) + "min");
+      logInfo("[PENDING] Credit recovered for " + userName);
+      pendingRemoveAt(i);
+    } else {
+      reportEvent("pending_retry_failed", 2, err, userName, macNC, 0, mins);
+      logWarn("[PENDING] Retry failed: " + err);
+      remoteEnqueue(String("[ERROR] Pending credit retry failed: ") + err);
+    }
+    return;   // one slot per tick
   }
 }
 
@@ -2482,7 +2983,7 @@ bool runCoinCycle(const String& mac, uint16_t& outPulses, uint16_t& outCoins,
   macNC.toUpperCase();
   if (!performCredit(userName, (uint16_t)minutes, err, macNC)) {
     lastCycleText = "Error: " + err;
-    pendingSave(userName, (uint16_t)minutes);   // coins taken - credit must not be lost
+    pendingSave(userName, (uint16_t)minutes, macNC);   // coins taken - must not be lost
     cycleState = CYCLE_IDLE;
     return false;
   }
@@ -2600,9 +3101,9 @@ void creditBatchNow() {
                     " minute(s) (" + String(finalMinutes) + " total this session)";
     // A cumulative credit has just covered any earlier failed batches -
     // clear the stale pending record so the retry loop never double-applies.
-    if (pending.magic == PENDING_MAGIC) {
+    if (pendingFindIndex(userName) >= 0) {
       logInfo("[PENDING] Earlier uncredited amount now covered by this credit - clearing recovery record");
-      pendingClear();
+      pendingClearFor(userName);
     }
   } else {
     lastCycleText = "Error: " + err;
@@ -2614,7 +3115,7 @@ void creditBatchNow() {
     if (deficit > 0) {
       // Coins taken - the FULL deficit must not be lost. Monotone, so a
       // later failure overwriting this record can only widen it.
-      pendingSave(userName, (uint16_t)deficit);
+      pendingSave(userName, (uint16_t)deficit, macNC);
     }
   }
 }
@@ -2651,9 +3152,14 @@ void endSession() {
   digitalWrite(gatePin(), gateCloseLevel());   // stop new coins first
   // Closeout grace: a coin that was dropping while we settled must not be
   // cut mid-train (a P10 train lasts ~0.6 s), or its value would be lost.
+  // R6: when NOTHING has been counted yet (Done pressed while the coin is
+  // still travelling through the acceptor), never take the early idle-line
+  // exit - wait the full grace so the arriving pulses are still counted.
+  bool noPulsesAtGrace = (readPulses() == 0);
   uint32_t graceStart = millis();
   while ((uint32_t)(millis() - graceStart) < 1200UL) {
-    if (waitForIdleLine(COIN_BURST_GAP_MS)) break;
+    if (!noPulsesAtGrace && waitForIdleLine(COIN_BURST_GAP_MS)) break;
+    delay(10);
   }
   detachInterrupt(digitalPinToInterrupt(PIN_COIN));
   finalPulses = readPulses();   // freeze: the customer owns everything counted
@@ -2665,19 +3171,43 @@ void endSession() {
   String userName = sessionUserName();
   uint32_t deficit = (target >= finalMinutes) ? (target - finalMinutes) : 0;
   if (deficit > 0) {
-    // Uncovered value: persist the full deficit (replaces/keeps any earlier
-    // pending record - the deficit is monotone so this is always safe).
-    if (userName.length() > 0 &&
-        !(pending.magic == PENDING_MAGIC && pending.minutes >= deficit)) {
-      pendingSave(userName, (uint16_t)deficit);
+    // R6: deliver the closeout value NOW when possible, so a "Done" press a
+    // moment after the coin still awards the time inside the same request
+    // (previously it only went to the recovery queue - the popup answered
+    // "coins.wait.expired" and the time arrived with a confusing delay).
+    uint16_t deficitMin = (deficit > MAX_CREDIT_MINUTES) ? MAX_CREDIT_MINUTES
+                                                         : (uint16_t)deficit;
+    String err;
+    String macNC = activeMac;
+    macNC.replace(":", "");
+    macNC.toUpperCase();
+    bool delivered = (userName.length() > 0) &&
+                     performCredit(userName, deficitMin, err, macNC);
+    if (delivered) {
+      uint32_t total = (uint32_t)finalMinutes + deficitMin;
+      if (total > MAX_CREDIT_MINUTES) total = MAX_CREDIT_MINUTES;
+      finalMinutes = (uint16_t)total;
+      sessionSalesCoins  += (finalPulses >= finalCoins) ? (finalPulses - finalCoins) : 0;
+      sessionSalesMinutes += deficitMin;
+      finalCoins = finalPulses;
+      pendingClearFor(userName);
+      logInfo("[COIN] Closeout " + String(deficitMin) + " minute(s) delivered on session end");
+      deficit = 0;   // delivered now - nothing is pending
+    } else {
+      // Uncovered value: persist the full deficit. The deficit is monotone
+      // per customer, so a re-save can only widen that customer's record.
+      if (userName.length() > 0) {
+        pendingSave(userName, (uint16_t)deficit, macNC);
+      }
     }
-  } else if (pending.magic == PENDING_MAGIC) {
-    // Everything is delivered - drop a stale recovery record.
-    pendingClear();
+  } else {
+    // Everything is delivered - drop this customer's stale recovery record.
+    pendingClearFor(userName);
   }
 
   if (sessionSalesCoins > 0 || sessionSalesMinutes > 0) {
     salesRecordSale(sessionSalesCoins, sessionSalesMinutes);   // one commit
+    reportSale((uint16_t)sessionSalesCoins, (uint16_t)sessionSalesMinutes, userName, activeMac);
     sessionSalesCoins = 0;
     sessionSalesMinutes = 0;
   }
@@ -2816,6 +3346,10 @@ void handleCoin() {
     sendCycleError("Coin cycle already in progress");
     return;
   }
+  if (pendingCount() >= PENDING_SLOTS) {
+    sendCycleError("Coin slot closed - earlier purchases are still pending recovery");
+    return;
+  }
 
   uint16_t pulses = 0, coins = 0, minutes = 0;
   String err;
@@ -2827,6 +3361,9 @@ void handleCoin() {
     server.send(200, "application/json", j);
     logInfo("[CREDIT] " + mac + " credited with " + String(minutes) + " minute(s)");
     salesRecordSale(coins, minutes);
+    String coinUser = mac;
+    coinUser.replace(":", "");
+    reportSale(coins, minutes, coinUser, mac);
     remoteEnqueue(String("[INFO] Credit ") + mac + " " + String(minutes) + "min");
   } else {
     sendCycleError(err);
@@ -2866,7 +3403,7 @@ void handleVoucherData() {
 }
 
 void handleStats() {
-  String j = "{\"ok\":true,\"device\":\"" + jsonEscape(String(config.deviceId)) +
+  String j = "{\"ok\":true,\"rev\":\"" FW_REVISION "\",\"device\":\"" + jsonEscape(String(config.deviceId)) +
              "\",\"boots\":" + String(sales.bootCount) +
              ",\"totalCycles\":" + String(sales.totalCycles) +
              ",\"totalCoins\":" + String(sales.totalCoins) +
@@ -2989,6 +3526,17 @@ void handleTopUp() {
   lastTopUpStartMs = millis();
 
   if (cycleState != CYCLE_IDLE) { sendJuanfiError("coinslot.busy"); return; }
+
+  // R7.1: never take a coin we cannot record. If the recovery store is full,
+  // several earlier purchases are still uncredited (router/API outage) - the
+  // slot stays closed until the retry loop drains the backlog.
+  if (pendingCount() >= PENDING_SLOTS) {
+    reportEvent("coinslot_blocked_pending", 1,
+                "Coin slot refused: recovery store full (" + String(pendingCount()) + ")",
+                "", "", 0, 0);
+    sendJuanfiError("coin.slot.notavailable");
+    return;
+  }
 
   String voucher = urlDecode(server.arg("voucher"));
   voucher.trim();   // hidden spaces from phone keyboards must not make ghost users
@@ -3393,6 +3941,7 @@ void watchWifi() {
       lastWifiHardResetMs = 0;
       gatewayFailCount = 0;
       logInfo("[NETWORK] Reconnected to hAP Lite. IP: " + WiFi.localIP().toString());
+      reportEvent("wifi_restored", 0, "Reconnected at " + WiFi.localIP().toString(), "", "", 0, 0);
     }
 
     // A station can stay "connected" while the link is actually dead.
@@ -3426,6 +3975,7 @@ void watchWifi() {
     lastWifiHardResetMs = now;
     logErr("[NETWORK ERROR] Disconnected from hAP Lite SSID. Status: " +
            wifiStatusText(st) + ". Attempting recovery...");
+    reportEvent("wifi_lost", 1, "Disconnected: " + wifiStatusText(st), "", "", 0, 0);
   }
 
   if (now - lastWifiCheckMs >= WIFI_RECONNECT_INTERVAL_MS) {
@@ -3434,21 +3984,70 @@ void watchWifi() {
     WiFi.reconnect();
   }
 
-  if (now - wifiDownSince >= WIFI_HARD_RESET_AFTER_MS &&
+  // R7: never reset the radio or reboot while a coin session is open or a
+  // credit is still queued for recovery - a reboot there can lose coins.
+  bool safeToRecover = (cycleState == CYCLE_IDLE) && !pendingAny();
+  if (safeToRecover &&
+      now - wifiDownSince >= WIFI_HARD_RESET_AFTER_MS &&
       now - lastWifiHardResetMs >= WIFI_HARD_RESET_AFTER_MS) {
     lastWifiHardResetMs = now;
     logErr("[NETWORK ERROR] Still offline after 60s - re-initializing the Wi-Fi stack");
     WiFi.disconnect(true);
     delay(100);
     WiFi.begin(config.ssid, config.pass);
+  } else if (!safeToRecover && now - wifiDownSince >= WIFI_HARD_RESET_AFTER_MS) {
+    logWarn("[NETWORK] Offline but a coin session/credit is active - deferring radio reset");
   }
 
-  if (now - wifiDownSince >= WIFI_RESTART_AFTER_MS) {
-    logErr("[NETWORK ERROR] Still offline after 120s - rebooting the ESP");
+  if (safeToRecover && now - wifiDownSince >= WIFI_RESTART_AFTER_MS) {
+    logErr("[NETWORK ERROR] Still offline after 10 min - rebooting the ESP");
     delay(100);
     ESP.restart();
   }
 }
+
+// R5 - BOOT-ORDER SELF-HEAL: while the setup portal is up (e.g. the ESP
+// booted before the hAP Lite finished booting, so the 3x15s boot join
+// window expired), keep retrying the configured SSID and leave the portal
+// automatically as soon as the router is reachable. Without this, the unit
+// stayed in setup mode FOREVER - 10.0.0.5 unreachable, coinslot busy -
+// until someone power-cycled it (the old "router first, ESP second" rule).
+void watchPortalJoin() {
+  if (config.configured != 1) return;          // nothing to join yet
+  uint32_t now = millis();
+  if (now - lastPortalJoinMs < PORTAL_JOIN_RETRY_MS) return;
+  lastPortalJoinMs = now;
+
+  logInfo("[NETWORK] Setup portal is active - retrying SSID \"" +
+          String(config.ssid) + "\"");
+  WiFi.mode(WIFI_AP_STA);   // keep the 192.168.4.1 setup portal reachable
+  WiFi.begin(config.ssid, config.pass);
+
+  uint32_t start = millis();
+  while (millis() - start < PORTAL_JOIN_WAIT_MS && WiFi.status() != WL_CONNECTED) {
+    delay(100);
+    yield();
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    logWarn("[NETWORK] hAP Lite still unreachable - setup portal stays up, retrying every 30s");
+    return;
+  }
+
+  // Router is back: adopt it and serve the coin endpoints again.
+  logInfo("[NETWORK] Reconnected to hAP Lite. IP: " + WiFi.localIP().toString());
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);            // drop the setup hotspot
+  configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+  portalMode = false;
+  wifiLostLogged = false;
+  wifiDownSince = 0;
+  lastWifiHardResetMs = 0;
+  gatewayFailCount = 0;
+  logInfo("[NETWORK] Coin endpoint ready at http://" + WiFi.localIP().toString() +
+          "/coin?mac=AA:BB:CC:DD:EE:FF");
+}
+
 
 void heapWatchdog() {
   uint32_t now = millis();
@@ -3514,6 +4113,7 @@ void registerRoutes() {
   server.on("/gatetest", HTTP_GET, handleGateTestPage);
   server.on("/reboot", HTTP_GET, handleReboot);
   server.on("/debugUsers", HTTP_GET, handleDebugUsers);
+  server.on("/reportTest", HTTP_GET, handleReportTest);
   server.on("/log", HTTP_GET, handleLog);
   server.on("/setRates", HTTP_GET, handleSetRates);
   server.on("/setRates", HTTP_POST, handleSetRates);
@@ -3522,6 +4122,33 @@ void registerRoutes() {
   server.on("/hotspot-detect.html", HTTP_GET, handleCaptive);
   server.onNotFound(handleNotFound);
 }
+
+// R7: OTA must also start when the bridge BOOTED INTO THE SETUP PORTAL and
+// later self-healed onto the router (watchPortalJoin). The old code only
+// called ArduinoOTA.begin() during a station-mode boot, so after a power
+// event that put the ESP in the portal first, OTA stayed dead until the next
+// reboot even though the unit was back online.
+#ifdef ESP32
+bool otaStarted = false;
+void ensureOtaStarted() {
+  if (otaStarted || portalMode || config.configured != 1) return;
+  ArduinoOTA.setHostname("piso-bridge");
+  ArduinoOTA.setPassword(config.apiPass);
+  ArduinoOTA.onStart([]() {
+    logWarn("[OTA] Update starting - coinslot must be idle");
+  });
+  ArduinoOTA.onEnd([]() { logInfo("[OTA] Update finished - restarting"); });
+  ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
+    if (p % 25 == 0) logInfo("[OTA] Progress: " + String(p * 100 / t) + "%");
+  });
+  ArduinoOTA.onError([](ota_error_t e) {
+    logErr("[OTA ERROR] Code " + String((int)e));
+  });
+  ArduinoOTA.begin();
+  otaStarted = true;
+  logInfo("[OTA] ArduinoOTA ready (password-protected)");
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // setup() / loop()
@@ -3583,6 +4210,10 @@ void setup() {
   salesSave();
   eepromCommitNow();   // one commit per boot (persist the boot counter)
   logInfo("[SALES] Boot count: " + String(sales.bootCount));
+  reportEvent("boot", 0,
+              "boot #" + String(sales.bootCount) + " reset=" + resetReasonText() +
+              " fw=" FW_REVISION,
+              "", "", 0, 0);
 
   registerRoutes();
 
@@ -3594,28 +4225,7 @@ void setup() {
   }
 
 #ifdef ESP32
-  // Over-the-air updates (LAN only, password-protected). MUST be started
-  // AFTER WiFi.mode() - the ArduinoOTA task grabs lwIP queues that only
-  // exist once the TCP/IP stack is up (starting it earlier asserts on a
-  // NULL queue and boot-loops). The OTA server is only serviced while the
-  // coinslot is idle (see loop()), so an update can never interrupt a
-  // credit burst - it simply waits for the session to end.
-  if (config.configured == 1 && !portalMode) {
-    ArduinoOTA.setHostname("piso-bridge");
-    ArduinoOTA.setPassword(config.apiPass);
-    ArduinoOTA.onStart([]() {
-      logWarn("[OTA] Update starting - coinslot must be idle");
-    });
-    ArduinoOTA.onEnd([]() { logInfo("[OTA] Update finished - restarting"); });
-    ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
-      if (p % 25 == 0) logInfo("[OTA] Progress: " + String(p * 100 / t) + "%");
-    });
-    ArduinoOTA.onError([](ota_error_t e) {
-      logErr("[OTA ERROR] Code " + String((int)e));
-    });
-    ArduinoOTA.begin();
-    logInfo("[OTA] ArduinoOTA ready (password-protected)");
-  }
+  ensureOtaStarted();
 #endif
 }
 
@@ -3627,15 +4237,21 @@ void loop() {
 #ifdef ESP32
   // OTA only when the coinslot is idle: an update must never interrupt a
   // credit burst or a pending recovery retry.
-  if (!portalMode && cycleState == CYCLE_IDLE && pending.magic != PENDING_MAGIC) {
+  if (!portalMode && cycleState == CYCLE_IDLE && !pendingAny()) {
+    ensureOtaStarted();   // R7: also starts after a portal-mode self-heal
     ArduinoOTA.handle();
   }
 #endif
-  if (!portalMode) watchWifi();
+  if (!portalMode) {
+    watchWifi();
+  } else {
+    watchPortalJoin();   // R5: boot-order safety net - leave the setup portal on our own
+  }
   if (!portalMode) tickPendingCredit();
   if (!portalMode) tickNtp();
   if (!portalMode) tickNightlyRestart();
   if (!portalMode) flushRemoteLogs();
+  if (!portalMode) tickReportOutbox();
   heapWatchdog();
   yield();
 }
